@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import time
 import torch
 import torch.nn as nn 
 from torch.nn import functional as F
@@ -224,7 +225,7 @@ if torch.cuda.is_available():
     device = 'cuda'
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
-print("using : ",device)
+print("device: ",device)
 
 import tiktoken
 
@@ -254,24 +255,52 @@ class DataLoaderLite:
         return x,y 
 
 
+max_lr= 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(step):
+    if step < warmup_steps:
+        return max_lr * (step+1) / warmup_steps
+    if step > max_steps:
+        return nim_lr
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    ceoff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 train_loader = DataLoaderLite(4,32)
 torch.set_float32_matmul_precision('high')
 
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-model = torch.compile(model)
+if device == 'cuda':
+    model = torch.compile(model)
 
 
-optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
 # Main loop of learning 
 for i in range(50):
-    x,y = train_loader.next_batch()
-    x,y = x.to(device), y.to(device)
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtypte=torch.bfloat16)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits,loss = model(x,y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm(model.parameters(),1.0)
+
+    lr = get_lr(i)
+    for param_group in optimizer.param_group:
+        param_group['lr'] = lr
     optimizer.step()
-    print(f"step: {i}, loss: {loss.item()}")
+    if device == 'cuda':
+        torch.cuda.synchronize() # wait for the GPU to finish work
+    t1 = time.time()
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = train_loader.B * train_loader.T
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
